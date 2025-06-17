@@ -163,4 +163,8 @@ cython_debug/
 .DS_Store
 uv.lock
 
-/saved_images/
+saved_images/
+rag_research_graph.egg-info/
+.langgraph_api
+
+
