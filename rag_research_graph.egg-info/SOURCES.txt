@@ -9,6 +9,7 @@ rag_research_graph.egg-info/top_level.txt
 src/index_graph/__init__.py
 src/index_graph/configuration.py
 src/index_graph/graph.py
+src/index_graph/image_indexer.py
 src/index_graph/state.py
 src/retrieval_graph/__init__.py
 src/retrieval_graph/configuration.py
