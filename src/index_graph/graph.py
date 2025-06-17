@@ -84,7 +84,7 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
                 elements = root.findall(url_tag)
                 print(f"   Found {len(elements)} elements with tag '{url_tag}'")
                 
-                for element in elements[:3]:  # Limiter pour debug
+                for element in elements:  
                     loc_element = element.find(loc_tag)
                     if loc_element is not None and loc_element.text:
                         urls_found.append(loc_element.text)

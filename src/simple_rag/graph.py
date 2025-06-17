@@ -200,8 +200,18 @@ Réponse complète:"""
                 response.content = response_content
 
     else:
-        # Standard prompt without images
-        prompt = hub.pull("langchaindoc/simple-rag")
+       
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        # Prompt local simple pour éviter les erreurs LangSmith
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """Tu es un assistant expert en LangChain et LangGraph. 
+            Utilise le contexte fourni pour répondre à la question de manière précise et utile.
+            
+            Contexte:
+            {context}"""),
+            ("human", "{question}")
+        ])
         
         configuration = RagConfiguration.from_runnable_config(config)
         model = load_chat_model(configuration.model)

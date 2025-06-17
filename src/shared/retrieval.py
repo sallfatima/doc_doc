@@ -23,9 +23,9 @@ def make_text_encoder(model: str) -> Embeddings:
             raise ValueError(f"Unsupported embedding provider: {provider}")
 
 
-## ✅  Wrapper async pour les opérations Pinecone bloquantes
+## ✅ CORRECTION: Wrapper async pour les opérations Pinecone bloquantes
 async def _get_or_create_pinecone_vs_async(index_name: str, embedding_model: Embeddings, namespace: str = "") -> "PineconeVectorStore":
-    """Create or connect to Pinecone vectorstore with namespace support - VERSION ASYNC."""
+    """Create or connect to Pinecone vectorstore with namespace support - VERSION ASYNC CORRIGÉE."""
     
     def _sync_pinecone_operations():
         """Opérations Pinecone synchrones à exécuter dans un thread séparé."""
@@ -51,15 +51,17 @@ async def _get_or_create_pinecone_vs_async(index_name: str, embedding_model: Emb
         
         return True
     
-    # ✅ Exécuter les opérations Pinecone dans un thread séparé
-    await asyncio.to_thread(_sync_pinecone_operations)
+    def _sync_create_vectorstore():
+        """Créer le vectorstore dans un thread séparé aussi."""
+        return PineconeVectorStore.from_existing_index(
+            index_name=index_name,
+            embedding=embedding_model,
+            namespace=namespace
+        )
     
-    # Créer le vectorstore (cette partie n'est pas bloquante)
-    vectorstore = PineconeVectorStore.from_existing_index(
-        index_name=index_name,
-        embedding=embedding_model,
-        namespace=namespace
-    )
+    # ✅ CORRECTION: Exécuter TOUTES les opérations Pinecone dans des threads séparés
+    await asyncio.to_thread(_sync_pinecone_operations)
+    vectorstore = await asyncio.to_thread(_sync_create_vectorstore)
     
     return vectorstore
 
@@ -71,8 +73,7 @@ async def make_text_indexer(
     embedding_model: Embeddings
 ) -> AsyncGenerator[PineconeVectorStore, None]:
     """
-    ✅ CORRECTION: Text indexer pour indexation dans namespace par défaut - VERSION ASYNC
-    Utilisé par index_graph pour indexer le contenu textuel
+    ✅ CORRECTION: Text indexer pour indexation dans namespace par défaut - VERSION ASYNC CORRIGÉE
     """
     vectorstore = await _get_or_create_pinecone_vs_async(
         os.environ["PINECONE_INDEX_NAME"], 
@@ -88,8 +89,7 @@ async def make_image_indexer(
     config: RunnableConfig,
 ) -> AsyncGenerator[PineconeVectorStore, None]:
     """
-    ✅ CORRECTION: Image indexer pour indexation dans namespace 'images' - VERSION ASYNC
-    Utilisé par image_indexer.py - COMPATIBLE avec votre code existant
+    ✅ CORRECTION: Image indexer pour indexation dans namespace 'images' - VERSION ASYNC CORRIGÉE
     """
     configuration = BaseConfiguration.from_runnable_config(config)
     embedding_model = make_text_encoder(configuration.embedding_model)
@@ -118,7 +118,7 @@ class SmartRetriever:
         print(f"🚀 SmartRetriever initialisé - Index: {index_name}")
     
     async def _ensure_stores_initialized(self):
-        """Initialise les stores de manière async si pas déjà fait."""
+        """✅ CORRECTION: Initialise les stores de manière async si pas déjà fait."""
         if self._text_store is None:
             self._text_store = await _get_or_create_pinecone_vs_async(
                 self.index_name, self.embedding_model, namespace=""
@@ -144,17 +144,22 @@ class SmartRetriever:
         return is_image_focused
     
     async def _async_search_text(self, query: str, k: int) -> List[Document]:
-        """Asynchronous text search"""
+        """✅ CORRECTION: Asynchronous text search avec asyncio.to_thread"""
         if k <= 0:
             return []
         
         await self._ensure_stores_initialized()
         
-        # Exécuter la recherche dans un thread séparé
+        # ✅ CORRECTION: Filtrer search_kwargs pour enlever les clés invalides
         def _sync_text_search():
-            text_retriever = self._text_store.as_retriever(
-                search_kwargs={"k": k, **{key: val for key, val in self.search_kwargs.items() if key != "k"}}
-            )
+            # Filtrer les paramètres valides pour similarity_search
+            valid_search_kwargs = {
+                key: val for key, val in self.search_kwargs.items() 
+                if key in ["k", "filter", "namespace", "include_metadata", "include_values"]
+            }
+            valid_search_kwargs["k"] = k  # Assurer que k est défini
+            
+            text_retriever = self._text_store.as_retriever(search_kwargs=valid_search_kwargs)
             return text_retriever.invoke(query)
         
         docs = await asyncio.to_thread(_sync_text_search)
@@ -168,17 +173,22 @@ class SmartRetriever:
         return docs
     
     async def _async_search_images(self, query: str, k: int) -> List[Document]:
-        """Asynchronous image search"""
+        """✅ CORRECTION: Asynchronous image search avec asyncio.to_thread"""
         if k <= 0:
             return []
         
         await self._ensure_stores_initialized()
         
-        # Exécuter la recherche dans un thread séparé
+        # ✅ CORRECTION: Filtrer search_kwargs pour enlever les clés invalides
         def _sync_image_search():
-            image_retriever = self._image_store.as_retriever(
-                search_kwargs={"k": k, **{key: val for key, val in self.search_kwargs.items() if key != "k"}}
-            )
+            # Filtrer les paramètres valides pour similarity_search
+            valid_search_kwargs = {
+                key: val for key, val in self.search_kwargs.items() 
+                if key in ["k", "filter", "namespace", "include_metadata", "include_values"]
+            }
+            valid_search_kwargs["k"] = k  # Assurer que k est défini
+            
+            image_retriever = self._image_store.as_retriever(search_kwargs=valid_search_kwargs)
             return image_retriever.invoke(query)
         
         docs = await asyncio.to_thread(_sync_image_search)
@@ -219,14 +229,11 @@ class SmartRetriever:
         print(f"📊 Stratégie: {search_strategy} | Texte k={text_k}, Images k={image_k}")
         
         try:
-            # Exécuter les recherches en parallèle de manière async
-            text_docs, image_docs = await asyncio.gather(
-                self._async_search_text(query, text_k),
-                self._async_search_images(query, image_k),
-                return_exceptions=True
-            )
+            # ✅ CORRECTION: Exécuter les recherches en séquence pour éviter trop de threads
+            text_docs = await self._async_search_text(query, text_k)
+            image_docs = await self._async_search_images(query, image_k)
             
-            # Gérer les exceptions
+            # Gérer les erreurs
             if isinstance(text_docs, Exception):
                 print(f"❌ Text search failed: {text_docs}")
                 text_docs = []
@@ -259,8 +266,7 @@ async def make_retriever(
     config: RunnableConfig,
 ) -> AsyncGenerator[SmartRetriever, None]:
     """
-    ✅ CORRECTION: Créer le SmartRetriever pour la RECHERCHE - VERSION ASYNC
-    (Pas pour l'indexation - utilisez make_text_indexer et make_image_indexer pour ça)
+    ✅ CORRECTION: Créer le SmartRetriever pour la RECHERCHE - VERSION ASYNC CORRIGÉE
     """
     configuration = BaseConfiguration.from_runnable_config(config)
     embedding_model = make_text_encoder(configuration.embedding_model)
