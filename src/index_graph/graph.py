@@ -33,7 +33,11 @@ def check_index_config(state: IndexState, *, config: Optional[RunnableConfig] = 
     return {}
 
 async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig] = None) -> dict[str, List[str]]:
-    """Get the URLs from the sitemap with detailed debugging."""
+    """Get the URLs from the sitemap with detailed debugging - VERSION ASYNC CORRIGÉE."""
+    import aiohttp
+    import xml.etree.ElementTree as ET
+    import re
+    
     url = state.url_site_map
     print(f"🔍 Fetching sitemap from: {url}")
     
@@ -43,23 +47,20 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
     }
     
     try:
-        # Essayer d'abord avec requests pour debug
-        import requests
-        response = requests.get(url, headers=headers, timeout=30)
-        
-        print(f"📊 Response status: {response.status_code}")
-        print(f"📊 Content-Type: {response.headers.get('content-type', 'Unknown')}")
-        print(f"📊 Content length: {len(response.text)} characters")
-        
-        # Afficher les premières lignes pour debug
-        content_preview = response.text[:500]
-        print(f"📄 Content preview:\n{content_preview}")
-        
-        sitemap_content = response.text
+        # ✅  Utiliser aiohttp au lieu de requests
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=30) as response:
+                print(f"📊 Response status: {response.status}")
+                print(f"📊 Content-Type: {response.headers.get('content-type', 'Unknown')}")
+                
+                sitemap_content = await response.text()
+                print(f"📊 Content length: {len(sitemap_content)} characters")
+                
+                # Afficher les premières lignes pour debug
+                content_preview = sitemap_content[:500]
+                print(f"📄 Content preview:\n{content_preview}")
         
         # Analyse XML détaillée
-        import xml.etree.ElementTree as ET
-        
         try:
             root = ET.fromstring(sitemap_content)
             print(f"🔍 XML root tag: {root.tag}")
@@ -99,32 +100,14 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
             if not urls_found:
                 print("🔍 No URLs found with standard patterns. Analyzing XML structure:")
                 
-                def analyze_element(elem, depth=0):
-                    indent = "  " * depth
-                    print(f"{indent}Tag: {elem.tag}")
-                    if elem.text and elem.text.strip():
-                        text_preview = elem.text.strip()[:100]
-                        print(f"{indent}Text: {text_preview}")
-                    if elem.attrib:
-                        print(f"{indent}Attributes: {elem.attrib}")
-                    
-                    # Limiter la profondeur pour éviter trop d'output
-                    if depth < 3:
-                        for child in list(elem)[:5]:  # Limiter à 5 enfants
-                            analyze_element(child, depth + 1)
-                
-                print("📋 XML Structure Analysis:")
-                analyze_element(root)
-                
                 # Essayer de trouver toutes les URLs dans le texte
-                import re
                 url_pattern = r'https?://[^\s<>"]+langchain[^\s<>"]*'
                 found_urls = re.findall(url_pattern, sitemap_content)
                 
                 if found_urls:
                     print(f"🔍 Found URLs via regex: {len(found_urls)}")
-                    for url in found_urls[:5]:
-                        print(f"   📎 {url}")
+                    for found_url in found_urls[:5]:
+                        print(f"   📎 {found_url}")
                     urls_found = found_urls[:100]  # Limiter pour éviter trop d'URLs
                 
         except ET.ParseError as e:
@@ -133,7 +116,6 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
             print(sitemap_content[:1000])
             
             # Peut-être que c'est un index de sitemaps, essayer de trouver les URLs autrement
-            import re
             url_pattern = r'https?://[^\s<>"]+\.xml'
             xml_urls = re.findall(url_pattern, sitemap_content)
             
@@ -147,8 +129,8 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
         
         if urls_found:
             print("📋 First 5 URLs:")
-            for i, url in enumerate(urls_found[:5], 1):
-                print(f"   {i}. {url}")
+            for i, found_url in enumerate(urls_found[:5], 1):
+                print(f"   {i}. {found_url}")
         
         return {"urls_to_index": urls_found}
         
@@ -158,7 +140,6 @@ async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig
         traceback.print_exc()
         return {"urls_to_index": []}
 
-        
 async def index_docs(
     state: IndexState, *, config: Optional[RunnableConfig] = None
 ) -> dict[str, str]:
@@ -183,27 +164,36 @@ async def index_docs(
 
 async def index_url(url: str, config: Optional[RunnableConfig] = None) -> List[Document]:
     """
-    Index a web path - TEXTE ET IMAGES.
+    Index a web path - TEXTE ET IMAGES - VERSION ASYNC CORRIGÉE
     
-    ✅ CORRECTION : Utilise le nouveau système avec namespaces
+   
     - Texte → namespace par défaut ("")  
     - Images → namespace "images"
     """
     print(f"🔄 Indexing URL: {url}")
     
     try:
-        # Charger le contenu de la page
-        loader = WebBaseLoader(web_paths=(url,))
-        docs = loader.load()
+        # ✅  Utiliser asyncio.to_thread pour WebBaseLoader (bloquant)
+        def load_web_content(web_url):
+            from langchain_community.document_loaders import WebBaseLoader
+            loader = WebBaseLoader(web_paths=(web_url,))
+            return loader.load()
+        
+        # Charger le contenu de la page dans un thread séparé
+        docs = await asyncio.to_thread(load_web_content, url)
         
         # Récupérer le contenu HTML pour l'indexation d'images
         html_content = ""
         if docs:
             html_content = docs[0].page_content
         
-        # Diviser le texte en chunks
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        text_docs = text_splitter.split_documents(docs)
+        # ✅  Utiliser asyncio.to_thread pour le text splitter
+        def split_documents(documents):
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            return text_splitter.split_documents(documents)
+        
+        text_docs = await asyncio.to_thread(split_documents, docs)
         
         # ✅ INDEXATION DU TEXTE dans le namespace par défaut
         if text_docs:
@@ -236,9 +226,9 @@ async def index_url(url: str, config: Optional[RunnableConfig] = None) -> List[D
         
     except Exception as e:
         print(f"❌ Error indexing {url}: {e}")
+        import traceback
+        traceback.print_exc()
         return []
-
-
 # ✅ LANGGRAPH DEFINITION - PARTIE MANQUANTE RESTAURÉE
 builder = StateGraph(IndexState, input=InputState, config_schema=IndexConfiguration)
 
