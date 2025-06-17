@@ -1,189 +1,260 @@
-"""Simple RAG avec gestion d'images"""
+"""This "graph" simply exposes an endpoint for a user to upload docs to be indexed."""
 
-from langchain import hub
-from langchain_core.messages import HumanMessage, AIMessage
+import asyncio
+import os
+from typing import List, Optional
+
+import requests
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnableConfig
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
-from typing import List, Dict, Any
-import re
-import json
 
+from index_graph.configuration import IndexConfiguration
+from index_graph.state import IndexState, InputState
 from shared import retrieval
-from shared.utils import load_chat_model
-from simple_rag.configuration import RagConfiguration
-from simple_rag.state import GraphState, InputState
+from index_graph.image_indexer import index_ocr_from_images  # Import de votre fonction existante
 
 
-def extract_images_from_documents(documents) -> List[Dict[str, Any]]:
-    """Extrait les images des documents récupérés"""
-    images = []
+def check_index_config(state: IndexState, *, config: Optional[RunnableConfig] = None) -> dict[str, str]:
+    """Check the API key."""
+    configuration = IndexConfiguration.from_runnable_config(config)
+
+    if not configuration.api_key:
+        raise ValueError("API key is required for document indexing.")
     
-    for doc in documents:
-        # Vérifier si le document contient des références d'images
-        content = doc.page_content
-        metadata = doc.metadata or {}
+    if configuration.api_key != os.getenv("INDEX_API_KEY"):
+        raise ValueError("Authentication failed: Invalid API key provided.")
+    
+    if configuration.retriever_provider != "pinecone":
+        raise ValueError("Only Pinecone is currently supported for document indexing due to specific ID prefix requirements.")
+    
+    return {}
+
+async def get_sitemap_urls(state: IndexState, *, config: Optional[RunnableConfig] = None) -> dict[str, List[str]]:
+    """Get the URLs from the sitemap with detailed debugging."""
+    url = state.url_site_map
+    print(f"🔍 Fetching sitemap from: {url}")
+    
+    headers = {
+        "Accept": "application/xml",
+        "User-Agent": "Mozilla/5.0 (compatible; LangChainBot/1.0)",
+    }
+    
+    try:
+        # Essayer d'abord avec requests pour debug
+        import requests
+        response = requests.get(url, headers=headers, timeout=30)
         
-        # Chercher des patterns d'images dans le contenu
-        image_patterns = [
-            r'!\[.*?\]\((.*?)\)',  # Markdown images: ![alt](url)
-            r'<img[^>]+src=["\']([^"\']+)["\'][^>]*>',  # HTML img tags
-            r'https?://[^\s]+\.(jpg|jpeg|png|gif|webp|svg)',  # URLs d'images directes
-        ]
+        print(f"📊 Response status: {response.status_code}")
+        print(f"📊 Content-Type: {response.headers.get('content-type', 'Unknown')}")
+        print(f"📊 Content length: {len(response.text)} characters")
         
-        for pattern in image_patterns:
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    url = match[0] if match[0] else match[1]
-                else:
-                    url = match
+        # Afficher les premières lignes pour debug
+        content_preview = response.text[:500]
+        print(f"📄 Content preview:\n{content_preview}")
+        
+        sitemap_content = response.text
+        
+        # Analyse XML détaillée
+        import xml.etree.ElementTree as ET
+        
+        try:
+            root = ET.fromstring(sitemap_content)
+            print(f"🔍 XML root tag: {root.tag}")
+            print(f"🔍 XML attributes: {root.attrib}")
+            
+            # Essayer différents patterns XML
+            patterns_to_try = [
+                # Pattern standard
+                ("{http://www.sitemaps.org/schemas/sitemap/0.9}url", "{http://www.sitemaps.org/schemas/sitemap/0.9}loc"),
+                # Pattern sans namespace
+                ("url", "loc"),
+                # Pattern avec sitemap index
+                ("{http://www.sitemaps.org/schemas/sitemap/0.9}sitemap", "{http://www.sitemaps.org/schemas/sitemap/0.9}loc"),
+                ("sitemap", "loc"),
+            ]
+            
+            urls_found = []
+            
+            for url_tag, loc_tag in patterns_to_try:
+                print(f"🔍 Trying pattern: {url_tag} -> {loc_tag}")
+                elements = root.findall(url_tag)
+                print(f"   Found {len(elements)} elements with tag '{url_tag}'")
                 
-                if url and url not in [img['url'] for img in images]:
-                    images.append({
-                        'url': url,
-                        'source': metadata.get('source', 'Unknown'),
-                        'context': content[:200] + '...' if len(content) > 200 else content,
-                        'alt_text': extract_alt_text(content, url)
-                    })
+                for element in elements[:3]:  # Limiter pour debug
+                    loc_element = element.find(loc_tag)
+                    if loc_element is not None and loc_element.text:
+                        urls_found.append(loc_element.text)
+                        print(f"   ✅ Found URL: {loc_element.text}")
+                    else:
+                        print(f"   ❌ No loc element found in: {ET.tostring(element, encoding='unicode')[:100]}")
+                
+                if urls_found:
+                    print(f"✅ Success with pattern: {url_tag} -> {loc_tag}")
+                    break
+            
+            # Si toujours rien, essayer d'analyser la structure
+            if not urls_found:
+                print("🔍 No URLs found with standard patterns. Analyzing XML structure:")
+                
+                def analyze_element(elem, depth=0):
+                    indent = "  " * depth
+                    print(f"{indent}Tag: {elem.tag}")
+                    if elem.text and elem.text.strip():
+                        text_preview = elem.text.strip()[:100]
+                        print(f"{indent}Text: {text_preview}")
+                    if elem.attrib:
+                        print(f"{indent}Attributes: {elem.attrib}")
+                    
+                    # Limiter la profondeur pour éviter trop d'output
+                    if depth < 3:
+                        for child in list(elem)[:5]:  # Limiter à 5 enfants
+                            analyze_element(child, depth + 1)
+                
+                print("📋 XML Structure Analysis:")
+                analyze_element(root)
+                
+                # Essayer de trouver toutes les URLs dans le texte
+                import re
+                url_pattern = r'https?://[^\s<>"]+langchain[^\s<>"]*'
+                found_urls = re.findall(url_pattern, sitemap_content)
+                
+                if found_urls:
+                    print(f"🔍 Found URLs via regex: {len(found_urls)}")
+                    for url in found_urls[:5]:
+                        print(f"   📎 {url}")
+                    urls_found = found_urls[:100]  # Limiter pour éviter trop d'URLs
+                
+        except ET.ParseError as e:
+            print(f"❌ XML parsing error: {e}")
+            print("🔍 Content is not valid XML. Content preview:")
+            print(sitemap_content[:1000])
+            
+            # Peut-être que c'est un index de sitemaps, essayer de trouver les URLs autrement
+            import re
+            url_pattern = r'https?://[^\s<>"]+\.xml'
+            xml_urls = re.findall(url_pattern, sitemap_content)
+            
+            if xml_urls:
+                print(f"🔍 Found XML URLs (might be sitemap index): {xml_urls}")
+                return {"urls_to_index": []}  # Retourner vide pour l'instant
+            
+            return {"urls_to_index": []}
+        
+        print(f"🎯 Final result: {len(urls_found)} URLs to index")
+        
+        if urls_found:
+            print("📋 First 5 URLs:")
+            for i, url in enumerate(urls_found[:5], 1):
+                print(f"   {i}. {url}")
+        
+        return {"urls_to_index": urls_found}
+        
+    except Exception as e:
+        print(f"❌ Error fetching sitemap: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"urls_to_index": []}
+
+        
+async def index_docs(
+    state: IndexState, *, config: Optional[RunnableConfig] = None
+) -> dict[str, str]:
+    """Asynchronously index documents in the given state using the configured retriever.
+
+    This function now indexes both text content and images from web pages.
+    Text goes to the default namespace, images go to the 'images' namespace.
+
+    Args:
+        state (IndexState): The current state containing documents and retriever.
+        config (Optional[RunnableConfig]): Configuration for the indexing process.
+    """
+    print(f"🚀 Starting indexation of {len(state.urls_to_index)} URLs")
     
-    return images
+    # Process all URLs in parallel
+    chunk_tasks = [index_url(url, config) for url in state.urls_to_index]
+    await asyncio.gather(*chunk_tasks)
+
+    print("✅ All URLs indexed successfully")
+    return {}
 
 
-def extract_alt_text(content: str, image_url: str) -> str:
-    """Extrait le texte alternatif d'une image"""
-    # Chercher le texte alt dans markdown
-    markdown_pattern = rf'!\[([^\]]*)\]\([^)]*{re.escape(image_url)}[^)]*\)'
-    match = re.search(markdown_pattern, content)
-    if match:
-        return match.group(1)
+async def index_url(url: str, config: Optional[RunnableConfig] = None) -> List[Document]:
+    """
+    Index a web path - TEXTE ET IMAGES.
     
-    # Chercher le texte alt dans HTML
-    html_pattern = rf'<img[^>]+src=["\'][^"\']*{re.escape(image_url)}[^"\']*["\'][^>]+alt=["\']([^"\']+)["\'][^>]*>'
-    match = re.search(html_pattern, content, re.IGNORECASE)
-    if match:
-        return match.group(1)
+    ✅ CORRECTION : Utilise le nouveau système avec namespaces
+    - Texte → namespace par défaut ("")  
+    - Images → namespace "images"
+    """
+    print(f"🔄 Indexing URL: {url}")
     
-    return ""
-
-
-def is_image_related_query(question: str) -> bool:
-    """Détermine si la question est liée aux images"""
-    image_keywords = [
-        'image', 'images', 'photo', 'photos', 'picture', 'pictures',
-        'diagram', 'diagrams', 'figure', 'figures', 'chart', 'charts',
-        'graph', 'graphs', 'screenshot', 'screenshots', 'visual', 'visuals',
-        'illustration', 'illustrations', 'schéma', 'schémas', 'graphique',
-        'graphiques', 'capture', 'captures', 'visualisation', 'visualisations'
-    ]
-    
-    question_lower = question.lower()
-    return any(keyword in question_lower for keyword in image_keywords)
-
-
-def retrieve(state: GraphState, *, config: RagConfiguration) -> Dict[str, Any]: 
-    """Retrieve documents and images"""
-    print("---RETRIEVE---")
-    
-    # Extract human messages and concatenate them
-    question = " ".join(msg.content for msg in state.messages if isinstance(msg, HumanMessage))
-    
-    # Retrieval
-    with retrieval.make_retriever(config) as retriever:
-        documents = retriever.invoke(question)
+    try:
+        # Charger le contenu de la page
+        loader = WebBaseLoader(web_paths=(url,))
+        docs = loader.load()
         
-        # Extraire les images des documents
-        images = extract_images_from_documents(documents)
+        # Récupérer le contenu HTML pour l'indexation d'images
+        html_content = ""
+        if docs:
+            html_content = docs[0].page_content
         
-        # Vérifier si la question est liée aux images
-        is_image_query = is_image_related_query(question)
+        # Diviser le texte en chunks
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        text_docs = text_splitter.split_documents(docs)
         
-        return {
-            "documents": documents, 
-            "messages": state.messages,
-            "images": images,
-            "is_image_query": is_image_query
-        }
-
-
-async def generate(state: GraphState, *, config: RagConfiguration):
-    """Generate answer with image support"""
-    print("---GENERATE---")
-    
-    messages = state.messages
-    documents = state.documents
-    images = getattr(state, 'images', [])
-    is_image_query = getattr(state, 'is_image_query', False)
-
-    # Utiliser un prompt personnalisé qui gère les images
-    if is_image_query and images:
-        prompt_template = """Tu es un assistant expert en documentation technique. 
-        Réponds à la question de l'utilisateur en utilisant les documents fournis et les images disponibles.
-
-        Documents disponibles:
-        {context}
-
-        Images disponibles:
-        {images_info}
-
-        Instructions:
-        1. Réponds d'abord à la question basée sur les documents
-        2. Si des images sont pertinentes, mentionne-les avec leurs URLs
-        3. Décris brièvement le contenu des images quand c'est pertinent
-        4. Formate ta réponse de manière claire et structurée
-
-        Question: {question}
-
-        Réponse:"""
+        # ✅ INDEXATION DU TEXTE dans le namespace par défaut
+        if text_docs:
+            print(f"📝 Indexing {len(text_docs)} text chunks from {url}")
+            
+            configuration = IndexConfiguration.from_runnable_config(config)
+            embedding_model = retrieval.make_text_encoder(configuration.embedding_model)
+            
+            async with retrieval.make_text_indexer(configuration, embedding_model) as text_vectorstore:
+                await text_vectorstore.aadd_texts(
+                    texts=[doc.page_content for doc in text_docs],
+                    metadatas=[{**doc.metadata, "source_type": "text", "indexed_url": url} for doc in text_docs],
+                    ids=[f"{url}--text--{i}" for i in range(len(text_docs))]
+                )
+            
+            print(f"✅ {len(text_docs)} text chunks indexed for {url}")
         
-        # Préparer les informations sur les images
-        images_info = ""
-        if images:
-            images_info = "\n".join([
-                f"- Image: {img['url']}\n  Source: {img['source']}\n  Description: {img['alt_text']}\n  Contexte: {img['context']}"
-                for img in images
-            ])
+        # ✅ INDEXATION DES IMAGES dans le namespace "images"
+        print(f"🖼️ Looking for images in {url}")
         
-        # Construire le contexte
-        context = "\n\n".join([doc.page_content for doc in documents])
-        question = " ".join(msg.content for msg in messages if isinstance(msg, HumanMessage))
+        try:
+            # Utiliser votre fonction existante d'indexation d'images
+            await index_ocr_from_images(url, html_content, config)
+            print(f"✅ Images indexed for {url}")
+        except Exception as e:
+            print(f"⚠️ Warning: Could not index images for {url}: {e}")
         
-        # Créer le prompt final
-        formatted_prompt = prompt_template.format(
-            context=context,
-            images_info=images_info,
-            question=question
-        )
+        print(f"✅ Successfully indexed {url}")
+        return text_docs
         
-        configuration = RagConfiguration.from_runnable_config(config)
-        model = load_chat_model(configuration.model)
-        
-        response = await model.ainvoke([HumanMessage(content=formatted_prompt)])
-        
-    else:
-        # Utiliser le prompt standard si pas de query image ou pas d'images
-        prompt = hub.pull("langchaindoc/simple-rag")
-        
-        configuration = RagConfiguration.from_runnable_config(config)
-        model = load_chat_model(configuration.model)
-
-        # Chain
-        rag_chain = prompt | model
-        response = await rag_chain.ainvoke({"context": documents, "question": messages})
-    
-    return {"messages": [response], "documents": documents, "images": images}
+    except Exception as e:
+        print(f"❌ Error indexing {url}: {e}")
+        return []
 
 
-# Définir le workflow
-workflow = StateGraph(GraphState, input=InputState, config_schema=RagConfiguration)
+# ✅ LANGGRAPH DEFINITION - PARTIE MANQUANTE RESTAURÉE
+builder = StateGraph(IndexState, input=InputState, config_schema=IndexConfiguration)
 
-# Define the nodes
-workflow.add_node("retrieve", retrieve)
-workflow.add_node("generate", generate)
+# Add nodes
+builder.add_node("check_index_config", check_index_config)
+builder.add_node("get_sitemap_urls", get_sitemap_urls) 
+builder.add_node("index_docs", index_docs)
 
-# Build graph
-workflow.add_edge(START, "retrieve")
-workflow.add_edge("retrieve", "generate")
-workflow.add_edge("generate", END)
+# Add edges
+builder.add_edge(START, "check_index_config")
+builder.add_edge("check_index_config", "get_sitemap_urls")
+builder.add_edge("get_sitemap_urls", "index_docs")
+builder.add_edge("index_docs", END)
 
-# Compile
-graph = workflow.compile()
-graph.name = "SimpleRagWithImages"
+# Compile into a graph object that you can invoke and deploy.
+graph = builder.compile()
+graph.name = "IndexGraph"
+
+print("🎯 IndexGraph compiled successfully with namespace-based indexing")

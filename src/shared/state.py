@@ -1,81 +1,41 @@
-"""Shared functions for state management."""
+"""State management for the index graph.
 
-import hashlib
-import uuid
-from typing import Any, Literal, Optional, Union
+This module defines the state structures used in the index graph for
+document indexing operations.
+"""
 
-from langchain_core.documents import Document
-
-
-def _generate_uuid(page_content: str) -> str:
-    """Generate a UUID for a document based on page content."""
-    md5_hash = hashlib.md5(page_content.encode()).hexdigest()
-    return str(uuid.UUID(md5_hash))
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
-def reduce_docs(
-    existing: Optional[list[Document]],
-    new: Union[
-        list[Document],
-        list[dict[str, Any]],
-        list[str],
-        str,
-        Literal["delete"],
-    ],
-) -> list[Document]:
-    """Reduce and process documents based on the input type.
-
-    This function handles various input types and converts them into a sequence of Document objects.
-    It can delete existing documents, create new ones from strings or dictionaries, or return the existing documents.
-    It also combines existing documents with the new one based on the document ID.
-
-    Args:
-        existing (Optional[Sequence[Document]]): The existing docs in the state, if any.
-        new (Union[Sequence[Document], Sequence[dict[str, Any]], Sequence[str], str, Literal["delete"]]):
-            The new input to process. Can be a sequence of Documents, dictionaries, strings, a single string,
-            or the literal "delete".
+@dataclass(kw_only=True)
+class InputState:
+    """Represents the input state for the index graph.
+    
+    This class defines the structure of the input state for indexing operations,
+    which includes the sitemap URL to process.
     """
-    if new == "delete":
-        return []
+    
+    url_site_map: str
+    """URL of the sitemap to process for document indexing."""
 
-    existing_list = list(existing) if existing else []
-    if isinstance(new, str):
-        return existing_list + [
-            Document(page_content=new, metadata={"uuid": _generate_uuid(new)})
-        ]
 
-    new_list = []
-    if isinstance(new, list):
-        existing_ids = set(doc.metadata.get("uuid") for doc in existing_list)
-        for item in new:
-            if isinstance(item, str):
-                item_id = _generate_uuid(item)
-                new_list.append(Document(page_content=item, metadata={"uuid": item_id}))
-                existing_ids.add(item_id)
-
-            elif isinstance(item, dict):
-                metadata = item.get("metadata", {})
-                item_id = metadata.get("uuid") or _generate_uuid(
-                    item.get("page_content", "")
-                )
-
-                if item_id not in existing_ids:
-                    new_list.append(
-                        Document(**{**item, "metadata": {**metadata, "uuid": item_id}})
-                    )
-                    existing_ids.add(item_id)
-
-            elif isinstance(item, Document):
-                item_id = item.metadata.get("uuid", "")
-                if not item_id:
-                    item_id = _generate_uuid(item.page_content)
-                    new_item = item.copy(deep=True)
-                    new_item.metadata["uuid"] = item_id
-                else:
-                    new_item = item
-
-                if item_id not in existing_ids:
-                    new_list.append(new_item)
-                    existing_ids.add(item_id)
-
-    return existing_list + new_list
+@dataclass(kw_only=True) 
+class IndexState(InputState):
+    """State of the index graph for document indexing operations.
+    
+    This state tracks the progress of indexing operations including
+    URLs discovered from sitemaps and indexing status.
+    """
+    
+    urls_to_index: List[str] = field(default_factory=list)
+    """List of URLs discovered from the sitemap that need to be indexed."""
+    
+    indexed_count: int = field(default=0)
+    """Number of URLs that have been successfully indexed."""
+    
+    failed_urls: List[str] = field(default_factory=list)
+    """List of URLs that failed to index."""
+    
+    status: str = field(default="pending")
+    """Current status of the indexing operation: pending, processing, completed, failed."""

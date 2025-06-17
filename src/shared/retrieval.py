@@ -1,16 +1,11 @@
-"""Manage the configuration of various retrievers with optimized namespace approach.
-
-This module provides functionality to create and manage retrievers using
-a single Pinecone index with namespaces for better performance and cost efficiency.
-"""
 
 import os
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional, Dict, Any
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator, List, Dict, Any
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
-from langchain_core.vectorstores import VectorStoreRetriever
 from langchain_core.documents import Document
 from shared.configuration import BaseConfiguration
 from langchain_pinecone import PineconeVectorStore
@@ -52,41 +47,61 @@ def _get_or_create_pinecone_vs(index_name: str, embedding_model: Embeddings, nam
     )
 
 
+## ✅ INDEXERS CORRIGES POUR L'INDEXATION
+@asynccontextmanager
+async def make_text_indexer(
+    configuration: BaseConfiguration, 
+    embedding_model: Embeddings
+) -> AsyncGenerator[PineconeVectorStore, None]:
+    """
+    ✅ CORRECTION: Text indexer pour indexation dans namespace par défaut
+    Utilisé par index_graph pour indexer le contenu textuel
+    """
+    vectorstore = _get_or_create_pinecone_vs(
+        os.environ["PINECONE_INDEX_NAME"], 
+        embedding_model,
+        namespace=""  # Namespace par défaut pour le texte
+    )
+    print(f"📝 Text indexer créé - Index: {os.environ['PINECONE_INDEX_NAME']}, Namespace: '' (default)")
+    yield vectorstore
+
+
+@asynccontextmanager
+async def make_image_indexer(
+    config: RunnableConfig,
+) -> AsyncGenerator[PineconeVectorStore, None]:
+    """
+    ✅ CORRECTION: Image indexer pour indexation dans namespace 'images'
+    Utilisé par image_indexer.py - COMPATIBLE avec votre code existant
+    """
+    configuration = BaseConfiguration.from_runnable_config(config)
+    embedding_model = make_text_encoder(configuration.embedding_model)
+    vectorstore = _get_or_create_pinecone_vs(
+        os.environ["PINECONE_INDEX_NAME"],  # Même index que le texte !
+        embedding_model,
+        namespace="images"  # Namespace séparé pour les images
+    )
+    print(f"🖼️ Image indexer créé - Index: {os.environ['PINECONE_INDEX_NAME']}, Namespace: 'images'")
+    yield vectorstore
+
+
+# ✅ SMART RETRIEVER POUR LA RECHERCHE (pas pour l'indexation)
 class SmartRetriever:
     """
-    Intelligent retriever optimized for async operations.
-    No more blocking calls!
+    SmartRetriever pour la recherche (pas l'indexation)
+    Utilise les deux namespaces pour récupérer texte + images
     """
     
-    def __init__(
-        self,
-        embedding_model: Embeddings,
-        index_name: str,
-        search_kwargs: Dict[str, Any]
-    ):
+    def __init__(self, embedding_model: Embeddings, index_name: str, search_kwargs: Dict[str, Any]):
         self.embedding_model = embedding_model
         self.index_name = index_name
         self.search_kwargs = search_kwargs
         
-        # Create vectorstores for each namespace - LAZY LOADING
-        self._text_store = None
-        self._image_store = None
-    
-    def _get_text_store(self):
-        """Lazy loading of text store."""
-        if self._text_store is None:
-            self._text_store = _get_or_create_pinecone_vs(
-                self.index_name, self.embedding_model, namespace=""
-            )
-        return self._text_store
-    
-    def _get_image_store(self):
-        """Lazy loading of image store."""
-        if self._image_store is None:
-            self._image_store = _get_or_create_pinecone_vs(
-                self.index_name, self.embedding_model, namespace="images"
-            )
-        return self._image_store
+        # Create vectorstores for each namespace
+        self.text_store = _get_or_create_pinecone_vs(index_name, embedding_model, namespace="")
+        self.image_store = _get_or_create_pinecone_vs(index_name, embedding_model, namespace="images")
+        
+        print(f"🚀 SmartRetriever initialisé - Index: {index_name}")
     
     def _is_image_focused_query(self, query: str) -> bool:
         """Determine if the query is primarily image-focused."""
@@ -97,147 +112,118 @@ class SmartRetriever:
             'illustration', 'illustrations', 'schéma', 'schémas', 'graphique',
             'montrer', 'afficher', 'voir', 'regarder', 'show', 'display', 'view'
         ]
-        
         query_lower = query.lower()
-        return any(keyword in query_lower for keyword in image_keywords)
+        is_image_focused = any(keyword in query_lower for keyword in image_keywords)
+        print(f"🧠 Analyse query: '{query}' -> Image-focused: {is_image_focused}")
+        return is_image_focused
+    
+    def _sync_search_text(self, query: str, k: int) -> List[Document]:
+        """Synchronous text search"""
+        if k <= 0:
+            return []
+        
+        text_retriever = self.text_store.as_retriever(
+            search_kwargs={"k": k, **{key: val for key, val in self.search_kwargs.items() if key != "k"}}
+        )
+        docs = text_retriever.invoke(query)
+        
+        # Add metadata
+        for doc in docs:
+            doc.metadata["source_type"] = "text"
+            doc.metadata["namespace"] = ""
+        
+        print(f"✅ Texte trouvé: {len(docs)} documents")
+        return docs
+    
+    def _sync_search_images(self, query: str, k: int) -> List[Document]:
+        """Synchronous image search"""
+        if k <= 0:
+            return []
+        
+        image_retriever = self.image_store.as_retriever(
+            search_kwargs={"k": k, **{key: val for key, val in self.search_kwargs.items() if key != "k"}}
+        )
+        docs = image_retriever.invoke(query)
+        
+        # Add metadata
+        for doc in docs:
+            doc.metadata["source_type"] = "image"
+            doc.metadata["namespace"] = "images"
+        
+        if docs:
+            print(f"✅ Images trouvées: {len(docs)}")
+            for i, doc in enumerate(docs[:3], 1):
+                caption = doc.metadata.get('caption', doc.page_content)[:80]
+                print(f"   {i}. {caption}...")
+        else:
+            print(f"⚠️ Aucune image trouvée pour: '{query}'")
+        
+        return docs
     
     async def aget_relevant_documents(self, query: str) -> List[Document]:
         """
-        Async retrieval with proper thread handling for blocking operations.
+        Async retrieval with thread isolation for blocking calls
         """
+        print(f"🔍 RECHERCHE: '{query}'")
+        
         is_image_focused = self._is_image_focused_query(query)
         
         # Adaptive search strategy
         if is_image_focused:
             text_k = max(1, self.search_kwargs.get("k", 4) // 3)
             image_k = self.search_kwargs.get("k", 6)
+            search_strategy = "image_focused"
         else:
             text_k = self.search_kwargs.get("k", 8)
             image_k = max(1, self.search_kwargs.get("k", 3))
+            search_strategy = "text_focused"
         
-        all_docs = []
+        print(f"📊 Stratégie: {search_strategy} | Texte k={text_k}, Images k={image_k}")
         
         try:
-            # Use asyncio.to_thread for blocking operations
-            async def search_text():
-                if text_k > 0:
-                    text_store = self._get_text_store()
-                    text_retriever = text_store.as_retriever(
-                        search_kwargs={"k": text_k, **{k: v for k, v in self.search_kwargs.items() if k != "k"}}
-                    )
-                    # Use to_thread for the blocking call
-                    docs = await asyncio.to_thread(text_retriever.invoke, query)
-                    
-                    # Add metadata
-                    for doc in docs:
-                        doc.metadata["source_type"] = "text"
-                        doc.metadata["namespace"] = ""
-                    
-                    return docs
-                return []
-            
-            async def search_images():
-                if image_k > 0:
-                    image_store = self._get_image_store()
-                    image_retriever = image_store.as_retriever(
-                        search_kwargs={"k": image_k, **{k: v for k, v in self.search_kwargs.items() if k != "k"}}
-                    )
-                    # Use to_thread for the blocking call
-                    docs = await asyncio.to_thread(image_retriever.invoke, query)
-                    
-                    # Add metadata
-                    for doc in docs:
-                        doc.metadata["source_type"] = "image"
-                        doc.metadata["namespace"] = "images"
-                    
-                    return docs
-                return []
-            
-            # Run searches concurrently
+            # Exécuter les recherches dans des threads séparés
             text_docs, image_docs = await asyncio.gather(
-                search_text(),
-                search_images(),
+                asyncio.to_thread(self._sync_search_text, query, text_k),
+                asyncio.to_thread(self._sync_search_images, query, image_k),
                 return_exceptions=True
             )
             
-            # Handle exceptions
+            # Gérer les exceptions
             if isinstance(text_docs, Exception):
-                logging.error(f"Text search failed: {text_docs}")
+                print(f"❌ Text search failed: {text_docs}")
                 text_docs = []
             
             if isinstance(image_docs, Exception):
-                logging.error(f"Image search failed: {image_docs}")
+                print(f"❌ Image search failed: {image_docs}")
                 image_docs = []
             
-            all_docs.extend(text_docs)
-            all_docs.extend(image_docs)
+            all_docs = text_docs + image_docs
+            
+            print(f"✅ RÉSULTAT: {len(text_docs)} texte + {len(image_docs)} images = {len(all_docs)} total")
+            return all_docs
         
         except Exception as e:
-            logging.error(f"Error during smart retrieval: {e}")
-        
-        logging.info(f"SmartRetriever: {len([d for d in all_docs if d.metadata.get('source_type')=='text'])} text, "
-                    f"{len([d for d in all_docs if d.metadata.get('source_type')=='image'])} images")
-        
-        return all_docs
+            print(f"💥 Erreur dans retrieval: {e}")
+            return []
     
     def get_relevant_documents(self, query: str) -> List[Document]:
-        """Sync wrapper - should be avoided in async context."""
+        """Sync method for compatibility"""
         return asyncio.run(self.aget_relevant_documents(query))
     
     async def ainvoke(self, query: str) -> List[Document]:
-        """Async invoke method for compatibility."""
+        """Async invoke for compatibility"""
         return await self.aget_relevant_documents(query)
-    
-    def invoke(self, query: str) -> List[Document]:
-        """Sync invoke - will use asyncio.to_thread when called from async context."""
-        try:
-            # Check if we're in an async context
-            loop = asyncio.get_running_loop()
-            # If we are, this is problematic - log a warning
-            logging.warning("Sync invoke called from async context - consider using ainvoke")
-            return asyncio.run_coroutine_threadsafe(
-                self.aget_relevant_documents(query), loop
-            ).result()
-        except RuntimeError:
-            # No event loop running, safe to use sync
-            return self.get_relevant_documents(query)
-
-## Indexer functions (for compatibility with existing indexing code)
-@asynccontextmanager
-async def make_text_indexer(
-    configuration: BaseConfiguration, 
-    embedding_model: Embeddings
-) -> AsyncGenerator[PineconeVectorStore, None]:
-    """Text indexer using default namespace."""
-    vectorstore = _get_or_create_pinecone_vs(
-        os.environ["PINECONE_INDEX_NAME"], 
-        embedding_model,
-        namespace=""  # Default namespace for text
-    )
-    yield vectorstore
 
 
-@asynccontextmanager
-async def make_image_indexer(
-    config: RunnableConfig,
-) -> AsyncGenerator[PineconeVectorStore, None]:
-    """Image indexer using 'images' namespace - COMPATIBLE WITH YOUR EXISTING CODE."""
-    configuration = BaseConfiguration.from_runnable_config(config)
-    embedding_model = make_text_encoder(configuration.embedding_model)
-    vectorstore = _get_or_create_pinecone_vs(
-        os.environ["PINECONE_INDEX_NAME"],  # Same index!
-        embedding_model,
-        namespace="images"  # Separate namespace for images
-    )
-    yield vectorstore
-
-
-## Main retriever function
+## ✅ RETRIEVER PRINCIPAL POUR LA RECHERCHE
 @asynccontextmanager
 async def make_retriever(
     config: RunnableConfig,
 ) -> AsyncGenerator[SmartRetriever, None]:
-    """Create the optimized SmartRetriever."""
+    """
+    ✅ CORRECTION: Créer le SmartRetriever pour la RECHERCHE
+    (Pas pour l'indexation - utilisez make_text_indexer et make_image_indexer pour ça)
+    """
     configuration = BaseConfiguration.from_runnable_config(config)
     embedding_model = make_text_encoder(configuration.embedding_model)
     

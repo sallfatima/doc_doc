@@ -27,4 +27,5 @@ src/shared/utils.py
 src/simple_rag/__init__.py
 src/simple_rag/configuration.py
 src/simple_rag/graph.py
+src/simple_rag/image_retrieval.py
 src/simple_rag/state.py
